@@ -14,6 +14,7 @@ export const CloudSidebar = ({
   onContextSelect,
   onAddCluster,
   onRemoveCluster,
+  onDiscoverClusters,
   activeResourceView,
   onResourceSelect
 }: {
@@ -22,6 +23,7 @@ export const CloudSidebar = ({
   onContextSelect: (c: ClusterContext | null) => void,
   onAddCluster: (config: NewClusterConfig) => void,
   onRemoveCluster: (id: string) => void,
+  onDiscoverClusters?: () => void,
   activeResourceView?: string,
   onResourceSelect?: (resource: string) => void
 }) => {
@@ -121,12 +123,42 @@ export const CloudSidebar = ({
             )
           })}
 
-          <button
-            onClick={() => setIsModalOpen(true)}
-            className="w-full mt-4 border border-dashed border-zinc-800 rounded-md p-2 text-xs text-zinc-500 hover:text-blue-400 hover:border-blue-500/30 hover:bg-blue-500/5 transition-all duration-200 flex items-center justify-center gap-2"
-          >
-            <Plus size={12} /> Add Cluster
-          </button>
+          <div className="space-y-2 mt-4">
+            {onDiscoverClusters && (
+              <button
+                onClick={onDiscoverClusters}
+                className="w-full border border-dashed border-blue-800/50 rounded-md p-2 text-xs text-blue-400 hover:text-blue-300 hover:border-blue-500/50 hover:bg-blue-500/10 transition-all duration-200 flex items-center justify-center gap-2"
+                title="Discover clusters from kubeconfig (Cmd+Shift+D)"
+              >
+                <Activity size={12} /> Discover Clusters
+              </button>
+            )}
+            <button
+              onClick={() => setIsModalOpen(true)}
+              className="w-full border border-dashed border-zinc-800 rounded-md p-2 text-xs text-zinc-500 hover:text-blue-400 hover:border-blue-500/30 hover:bg-blue-500/5 transition-all duration-200 flex items-center justify-center gap-2"
+            >
+              <Plus size={12} /> Add Cluster
+            </button>
+            <button
+              onClick={async () => {
+                if (confirm('Are you sure you want to reset the app? This will remove all clusters.')) {
+                  // Clear local storage/state via Tauri
+                  try {
+                    // @ts-ignore
+                    await window.__TAURI__.invoke('save_clusters', { clusters: [] });
+                    window.location.reload();
+                  } catch (e) {
+                    console.error(e);
+                    // Fallback reload
+                    window.location.reload();
+                  }
+                }
+              }}
+              className="w-full border border-dashed border-red-900/30 rounded-md p-2 text-xs text-red-700 hover:text-red-500 hover:border-red-500/30 hover:bg-red-500/5 transition-all duration-200 flex items-center justify-center gap-2 mt-4"
+            >
+              Reset App
+            </button>
+          </div>
         </div>
       </div>
 

@@ -18,18 +18,6 @@ export interface CloudProvider {
   authCommand: string;
 }
 
-declare global {
-  interface Window {
-    electron: {
-      getClusterInfo: (config: any) => Promise<any>;
-      getWorkloads: (config: any) => Promise<any>;
-      saveClusters: (clusters: any[]) => Promise<any>;
-      loadClusters: () => Promise<any[]>;
-      getResources: (config: any, resourceType: string) => Promise<any>;
-    };
-  }
-}
-
 export interface ClusterContext {
   id: string;
   name: string;
@@ -54,6 +42,7 @@ export interface NewClusterConfig {
 export interface Workload {
   id: string;
   name: string;
+  namespace: string;
   image: string;
   contextId: string;
   status: 'Running' | 'Pending' | 'Failed' | 'CrashLoopBackOff';
@@ -67,7 +56,3 @@ export const PROVIDERS: CloudProvider[] = [
   { id: 'azure', label: 'Azure AKS', icon: Cloud, color: 'text-blue-400', authCommand: 'az account set' },
   { id: 'gcp', label: 'Google GKE', icon: Globe, color: 'text-emerald-400', authCommand: 'gcloud config set project' },
 ];
-
-export const CLUSTERS: ClusterContext[] = [];
-
-export const INITIAL_WORKLOADS: Workload[] = [];

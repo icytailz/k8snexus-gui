@@ -1,10 +1,11 @@
 import React, { useState, useMemo } from 'react';
 import { Terminal } from 'lucide-react';
-import { CLUSTERS, INITIAL_WORKLOADS, ClusterContext, Workload, NewClusterConfig } from './types';
+import { ClusterContext, Workload, NewClusterConfig } from './types';
 import { CloudSidebar } from './components/CloudSidebar';
-import { WorkloadDashboard } from './components/WorkloadDashboard';
+import { Dashboard } from './components/Dashboard';
 import { TerminalPanel } from './components/TerminalPanel';
 import { getEnvColor, EnvBadge } from './components/ui/EnvBadge';
+import { tauri } from './lib/tauri';
 
 /* ==================================================================================================================
    MODULE: MAIN APP ORCHESTRATOR
@@ -31,33 +32,50 @@ export default function App() {
 
   // Load clusters on startup
   React.useEffect(() => {
-    if (window.electron) {
-      window.electron.loadClusters().then((savedClusters: ClusterContext[]) => {
-        if (savedClusters && savedClusters.length > 0) {
-          setClusters(savedClusters);
-          setActiveContext(savedClusters[0]);
+    tauri.loadClusters().then(async (savedClusters: ClusterContext[]) => {
+      if (savedClusters && savedClusters.length > 0) {
+        // Deduplicate saved clusters
+        const uniqueSaved = savedClusters.filter((c, index, self) =>
+          index === self.findIndex((t) => t.name === c.name)
+        );
+
+        setClusters(uniqueSaved);
+        setActiveContext(uniqueSaved[0]);
+
+        // If we found duplicates, save the cleaned list
+        if (uniqueSaved.length !== savedClusters.length) {
+          console.log(`Cleaned up ${savedClusters.length - uniqueSaved.length} duplicate clusters`);
+          tauri.saveClusters(uniqueSaved);
         }
-      });
-    }
+      } else {
+        // Auto-discover clusters from kubeconfig if no saved clusters
+        try {
+          const discovered = await tauri.discoverClusters();
+          console.log(`Discovered ${discovered.length} clusters from kubeconfig`);
+        } catch (err) {
+          console.error('Failed to auto-discover clusters:', err);
+        }
+      }
+    }).catch(err => console.error('Failed to load clusters:', err));
   }, []);
 
   // Save clusters whenever they change
   React.useEffect(() => {
-    if (window.electron && clusters.length > 0) {
-      window.electron.saveClusters(clusters);
+    if (clusters.length > 0) {
+      tauri.saveClusters(clusters).catch(err => console.error('Failed to save clusters:', err));
     }
   }, [clusters]);
 
   // Effect to refresh data when switching contexts or resource view
   React.useEffect(() => {
-    if (activeContext && window.electron) {
+    if (activeContext) {
       const fetchLatest = async () => {
         try {
-          const clusterInfo = await window.electron.getClusterInfo(activeContext);
+          const clusterInfo = await tauri.getClusterInfo(activeContext);
           setClusters(prev => prev.map(c => c.id === activeContext.id ? { ...c, ...clusterInfo } : c));
 
           if (activeResourceView === 'Pods') {
-            const workloadsRes = await window.electron.getWorkloads(activeContext);
+            const workloadsRes = await tauri.getWorkloads(activeContext);
             if (workloadsRes.error) {
               console.error("Workload fetch error:", workloadsRes.error);
             }
@@ -65,7 +83,7 @@ export default function App() {
             setWorkloads(prev => [...prev.filter(w => w.contextId !== activeContext.id), ...(workloadsRes.items || [])]);
           } else {
             // Generic resource fetch
-            const res = await window.electron.getResources(activeContext, activeResourceView);
+            const res = await tauri.getResources(activeContext, activeResourceView);
             if (res.error) {
               console.error(`Failed to fetch ${activeResourceView}:`, res.error);
             }
@@ -123,6 +141,119 @@ export default function App() {
     }
   };
 
+  // Discover clusters from kubeconfig
+  const handleDiscoverClusters = async () => {
+    try {
+      const discovered = await tauri.discoverClusters();
+
+      if (discovered.length === 0) {
+        console.log('No clusters found in kubeconfig');
+        return;
+      }
+
+      // Filter out clusters that already exist (case-insensitive)
+      const existingNames = new Set(clusters.map(c => c.name.toLowerCase()));
+      const uniqueDiscovered = discovered.filter(d => !existingNames.has(d.contextName.toLowerCase()));
+
+      if (uniqueDiscovered.length === 0) {
+        console.log('No new clusters found to import');
+        // Optional: Trigger a cleanup of existing duplicates just in case
+        const uniqueClusters = clusters.filter((c, index, self) =>
+          index === self.findIndex((t) => t.name === c.name)
+        );
+        if (uniqueClusters.length !== clusters.length) {
+          setClusters(uniqueClusters);
+          tauri.saveClusters(uniqueClusters);
+        }
+        return;
+      }
+
+      // Convert discovered clusters to ClusterContext
+      const newClusters: ClusterContext[] = uniqueDiscovered.map(d => ({
+        id: `discovered-${d.contextName}-${Date.now()}`,
+        name: d.contextName,
+        provider: d.provider,
+        region: 'auto-discovered',
+        environment: d.isCurrentContext ? 'dev' : 'local',
+        status: 'Connecting...',
+        cpuUsage: 0,
+        memUsage: 0,
+        nodeCount: 0,
+        kubeconfig: undefined, // Will use default kubeconfig
+      }));
+
+      // Combine and deduplicate everything
+      const allClusters = [...clusters, ...newClusters];
+      const uniqueAllClusters = allClusters.filter((c, index, self) =>
+        index === self.findIndex((t) => t.name === c.name)
+      );
+
+      setClusters(uniqueAllClusters);
+
+      // Set first discovered cluster as active if no active context
+      if (!activeContext && newClusters.length > 0) {
+        setActiveContext(newClusters[0]);
+      }
+
+      // Save immediately
+      try {
+        await tauri.saveClusters(uniqueAllClusters);
+        console.log(`Imported ${newClusters.length} new clusters (cleaned duplicates)`);
+      } catch (err) {
+        console.error('Failed to save discovered clusters:', err);
+      }
+    } catch (err) {
+      console.error('Failed to discover clusters:', err);
+    }
+  };
+
+  // Execute command in pod
+  const handleExecPod = async (workload: Workload) => {
+    if (!activeContext) return;
+
+    setIsTerminalOpen(true);
+    setTerminalHistory(prev => [...prev, `➜ ~ Connecting to pod ${workload.name}...`]);
+
+    try {
+      // Execute a shell command (trying bash first, then sh)
+      const command = ['/bin/bash', '-c', 'echo "Connected to pod. Type exit to close." && /bin/bash'];
+
+      const response = await tauri.execPodCommand(activeContext, {
+        namespace: workload.namespace || 'default',
+        podName: workload.name,
+        container: undefined, // Will use first container
+        command: ['/bin/sh', '-c', 'echo "=== Pod Shell ==="; echo "Pod: ' + workload.name + '"; echo "Image: ' + workload.image + '"; echo ""; ls -la']
+      });
+
+      if (response.error) {
+        setTerminalHistory(prev => [...prev, `Error: ${response.error}`]);
+      } else {
+        setTerminalHistory(prev => [...prev, response.output]);
+      }
+    } catch (err) {
+      setTerminalHistory(prev => [...prev, `Failed to exec into pod: ${err}`]);
+    }
+  };
+
+  // Keyboard shortcuts
+  React.useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Cmd/Ctrl + Shift + D = Discover Clusters
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'd') {
+        e.preventDefault();
+        handleDiscoverClusters();
+      }
+      // Cmd/Ctrl + ` = Toggle Terminal
+      if ((e.metaKey || e.ctrlKey) && e.key === '`') {
+        e.preventDefault();
+        setIsTerminalOpen(prev => !prev);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleDiscoverClusters]);
+
   return (
     <div className="flex flex-col h-screen bg-zinc-950 text-zinc-300 font-sans selection:bg-blue-500/30 overflow-hidden relative">
 
@@ -141,6 +272,7 @@ export default function App() {
           onContextSelect={setActiveContext}
           activeResourceView={activeResourceView}
           onResourceSelect={setActiveResourceView}
+          onDiscoverClusters={handleDiscoverClusters}
           onAddCluster={async (config) => {
             const newClusterId = `ctx-${config.name}-${Date.now()}`;
 
@@ -163,32 +295,29 @@ export default function App() {
             setActiveContext(newCluster);
 
             // Save immediately
-            if (window.electron) {
-              window.electron.saveClusters(updatedClusters);
+            try {
+              await tauri.saveClusters(updatedClusters);
+            } catch (err) {
+              console.error('Failed to save clusters:', err);
             }
 
-            if (window.electron) {
-              try {
-                // Fetch real cluster info
-                const clusterInfo = await window.electron.getClusterInfo({ ...config, id: newClusterId });
+            try {
+              // Fetch real cluster info
+              const clusterInfo = await tauri.getClusterInfo(newCluster);
 
-                setClusters(prev => prev.map(c => c.id === newClusterId ? { ...c, ...clusterInfo } : c));
+              setClusters(prev => prev.map(c => c.id === newClusterId ? { ...c, ...clusterInfo } : c));
 
-                // Fetch real workloads
-                const workloadsRes = await window.electron.getWorkloads({ ...config, id: newClusterId });
-                if (workloadsRes.error) {
-                  console.error("Workload fetch error:", workloadsRes.error);
-                  // You might want to show this in the UI
-                  setClusters(prev => prev.map(c => c.id === newClusterId ? { ...c, status: 'Warning' } : c));
-                }
-                setWorkloads(prev => [...prev, ...(workloadsRes.items || [])]);
-              } catch (error) {
-                console.error("Failed to fetch cluster data", error);
-                setClusters(prev => prev.map(c => c.id === newClusterId ? { ...c, status: 'Error' } : c));
+              // Fetch real workloads
+              const workloadsRes = await tauri.getWorkloads(newCluster);
+              if (workloadsRes.error) {
+                console.error("Workload fetch error:", workloadsRes.error);
+                // You might want to show this in the UI
+                setClusters(prev => prev.map(c => c.id === newClusterId ? { ...c, status: 'Warning' } : c));
               }
-            } else {
-              // Fallback for web mode (if needed, or just show error)
-              console.warn("Electron API not available");
+              setWorkloads(prev => [...prev, ...(workloadsRes.items || [])]);
+            } catch (error) {
+              console.error("Failed to fetch cluster data", error);
+              setClusters(prev => prev.map(c => c.id === newClusterId ? { ...c, status: 'Error' } : c));
             }
           }}
           onRemoveCluster={(id) => {
@@ -199,9 +328,7 @@ export default function App() {
               setActiveContext(newClusters.length > 0 ? newClusters[0] : null);
             }
             // Save immediately
-            if (window.electron) {
-              window.electron.saveClusters(newClusters);
-            }
+            tauri.saveClusters(newClusters).catch(err => console.error('Failed to save clusters:', err));
           }}
         />
 
@@ -225,9 +352,10 @@ export default function App() {
 
           {/* Module: Dashboard */}
           {activeResourceView === 'Pods' ? (
-            <WorkloadDashboard
+            <Dashboard
               activeContext={activeContext}
               visibleWorkloads={visibleWorkloads}
+              onExecPod={handleExecPod}
             />
           ) : (
             <div className="p-6 overflow-auto bg-zinc-950">
